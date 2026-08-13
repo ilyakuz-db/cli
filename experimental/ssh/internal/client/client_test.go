@@ -90,6 +90,20 @@ func TestValidate(t *testing.T) {
 			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "claude"},
 		},
 		{
+			name:    "ucode source without ide claude",
+			opts:    client.ClientOptions{ClusterID: "abc-123", UcodeSource: "/local/ucode"},
+			wantErr: "--ucode-source can only be used with --ide claude",
+		},
+		{
+			name:    "ucode source with ide vscode",
+			opts:    client.ClientOptions{ClusterID: "abc-123", IDE: "vscode", UcodeSource: "/local/ucode"},
+			wantErr: "--ucode-source can only be used with --ide claude",
+		},
+		{
+			name: "valid ucode source with ide claude",
+			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "claude", UcodeSource: "/local/ucode"},
+		},
+		{
 			name:    "environment version too low",
 			opts:    client.ClientOptions{ClusterID: "abc-123", EnvironmentVersion: 3},
 			wantErr: "environment version must be >= 4, got 3",

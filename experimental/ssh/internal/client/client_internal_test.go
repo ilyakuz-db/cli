@@ -352,44 +352,56 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 	const bashCmd = `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
 
 	t.Run("interactive returns non-login bash command", func(t *testing.T) {
-		args := buildRemoteShellArgs(ClientOptions{}, "")
+		args := buildRemoteShellArgs(ClientOptions{}, "", "")
 		require.Len(t, args, 1)
 		assert.Equal(t, bashCmd, args[0])
 	})
 
 	t.Run("interactive cds into workspace home when set", func(t *testing.T) {
-		args := buildRemoteShellArgs(ClientOptions{}, "/Workspace/Users/me@example.com")
+		args := buildRemoteShellArgs(ClientOptions{}, "/Workspace/Users/me@example.com", "")
 		require.Len(t, args, 1)
 		assert.Equal(t, `cd '/Workspace/Users/me@example.com' 2>/dev/null; `+bashCmd, args[0])
 	})
 
 	t.Run("non-interactive passes additional args verbatim", func(t *testing.T) {
 		additional := []string{"ls", "-la"}
-		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com")
+		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com", "")
 		assert.Equal(t, additional, args)
 	})
 
 	t.Run("ide claude bootstraps and launches ucode with context", func(t *testing.T) {
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "")
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "", "")
 		require.Len(t, args, 1)
-		assert.Equal(t, claudeRemoteBootstrap(""), args[0])
+		assert.Equal(t, claudeRemoteBootstrap("", ""), args[0])
 		assert.Contains(t, args[0], "exec ucode claude --append-system-prompt-file")
 		assert.Contains(t, args[0], "Databricks serverless cluster")
 		assert.NotContains(t, args[0], "exec bash")
+		// Without --ucode-source, ucode installs from the published GitHub build.
+		assert.Contains(t, args[0], "uv tool install git+https://github.com/anton-107/ucode")
+		assert.NotContains(t, args[0], "--reinstall")
 	})
 
 	t.Run("ide claude cds into workspace home and weaves it into context", func(t *testing.T) {
 		const wsHome = "/Workspace/Users/me@example.com"
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, wsHome)
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, wsHome, "")
 		require.Len(t, args, 1)
-		assert.Equal(t, `cd '`+wsHome+`' 2>/dev/null; `+claudeRemoteBootstrap(wsHome), args[0])
+		assert.Equal(t, `cd '`+wsHome+`' 2>/dev/null; `+claudeRemoteBootstrap(wsHome, ""), args[0])
 		// The resolved workspace home is interpolated into the system-prompt context.
 		assert.Contains(t, args[0], "working directory is "+wsHome)
 	})
 
+	t.Run("ide claude with ucode source force-reinstalls from the workspace path", func(t *testing.T) {
+		const ucodePath = "/Workspace/Users/me@example.com/.databricks/ssh-tunnel/ucode/ucode-0.1.0.tar.gz"
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "", ucodePath)
+		require.Len(t, args, 1)
+		// The local build is force-reinstalled from the uploaded sdist, not GitHub.
+		assert.Contains(t, args[0], "uv tool install --reinstall '"+ucodePath+"'")
+		assert.NotContains(t, args[0], "git+https://github.com/anton-107/ucode")
+	})
+
 	t.Run("ide claude with additional args passes them verbatim", func(t *testing.T) {
 		additional := []string{"echo", "hi"}
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption, AdditionalArgs: additional}, "")
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption, AdditionalArgs: additional}, "", "")
 		assert.Equal(t, additional, args)
 	})
 }
@@ -412,7 +424,7 @@ func TestBuildSSHArgsPTYPlacement(t *testing.T) {
 	}
 
 	t.Run("interactive forces a PTY before the destination", func(t *testing.T) {
-		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "/Workspace/Users/me@example.com", ClientOptions{})
+		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "/Workspace/Users/me@example.com", "", ClientOptions{})
 		ptyIdx := indexOf(args, "-t")
 		hostIdx := indexOf(args, "myhost")
 		require.NotEqual(t, -1, ptyIdx, "-t must be present for interactive sessions")
@@ -424,7 +436,7 @@ func TestBuildSSHArgsPTYPlacement(t *testing.T) {
 	})
 
 	t.Run("non-interactive does not force a PTY", func(t *testing.T) {
-		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "", ClientOptions{AdditionalArgs: []string{"ls", "-la"}})
+		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "", "", ClientOptions{AdditionalArgs: []string{"ls", "-la"}})
 		assert.Equal(t, -1, indexOf(args, "-t"), "no PTY for non-interactive passthrough")
 		hostIdx := indexOf(args, "myhost")
 		require.NotEqual(t, -1, hostIdx)

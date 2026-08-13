@@ -42,6 +42,7 @@ Connect to a dedicated cluster:
 	var baseEnvironment string
 	var autoApprove bool
 	var usagePolicyID string
+	var ucodeSource string
 
 	cmd.Flags().StringVar(&clusterID, "cluster", "", "Databricks dedicated cluster ID")
 	cmd.Flags().DurationVar(&shutdownDelay, "shutdown-delay", defaultShutdownDelay, "Delay before shutting down the server after the last client disconnects")
@@ -62,6 +63,9 @@ Connect to a dedicated cluster:
 
 	cmd.Flags().StringVar(&releasesDir, "releases-dir", "", "Directory for local SSH tunnel development releases")
 	cmd.Flags().MarkHidden("releases-dir")
+
+	cmd.Flags().StringVar(&ucodeSource, "ucode-source", "", "Local ucode source directory to build and use with --ide claude, instead of the published GitHub build (dev/test only)")
+	cmd.Flags().MarkHidden("ucode-source")
 
 	cmd.Flags().StringVar(&userKnownHostsFile, "user-known-hosts-file", "", "Path to user known hosts file for SSH client")
 	cmd.Flags().MarkHidden("user-known-hosts-file")
@@ -133,6 +137,7 @@ Connect to a dedicated cluster:
 			AdditionalArgs:       args,
 			AutoApprove:          autoApprove,
 			UsagePolicyID:        usagePolicyID,
+			UcodeSource:          ucodeSource,
 		}
 		if err := opts.Validate(); err != nil {
 			return err
