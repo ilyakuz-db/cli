@@ -1,0 +1,1 @@
+* `databricks ssh connect` now accepts `--ide claude`, which installs and launches Claude Code as a terminal agent inside the remote session, pre-authenticated against the workspace and seeded with environment context.

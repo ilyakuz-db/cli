@@ -368,6 +368,37 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com")
 		assert.Equal(t, additional, args)
 	})
+
+	t.Run("ide claude bootstraps and launches ucode with context", func(t *testing.T) {
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "")
+		require.Len(t, args, 1)
+		assert.Equal(t, claudeRemoteBootstrap(""), args[0])
+		assert.Contains(t, args[0], "exec ucode claude --append-system-prompt-file")
+		assert.Contains(t, args[0], "Databricks serverless cluster")
+		assert.NotContains(t, args[0], "exec bash")
+	})
+
+	t.Run("ide claude cds into workspace home and weaves it into context", func(t *testing.T) {
+		const wsHome = "/Workspace/Users/me@example.com"
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, wsHome)
+		require.Len(t, args, 1)
+		assert.Equal(t, `cd '`+wsHome+`' 2>/dev/null; `+claudeRemoteBootstrap(wsHome), args[0])
+		// The resolved workspace home is interpolated into the system-prompt context.
+		assert.Contains(t, args[0], "working directory is "+wsHome)
+	})
+
+	t.Run("ide claude with additional args passes them verbatim", func(t *testing.T) {
+		additional := []string{"echo", "hi"}
+		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption, AdditionalArgs: additional}, "")
+		assert.Equal(t, additional, args)
+	})
+}
+
+func TestIsGUIIDE(t *testing.T) {
+	assert.True(t, (&ClientOptions{IDE: "vscode"}).isGUIIDE())
+	assert.True(t, (&ClientOptions{IDE: "cursor"}).isGUIIDE())
+	assert.False(t, (&ClientOptions{IDE: "claude"}).isGUIIDE())
+	assert.False(t, (&ClientOptions{IDE: ""}).isGUIIDE())
 }
 
 func TestBuildSSHArgsPTYPlacement(t *testing.T) {

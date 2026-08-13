@@ -54,6 +54,11 @@ const (
 	minEnvironmentVersion    = 4
 )
 
+// claudeIDEOption is the --ide value that launches Claude Code as a terminal
+// agent *inside* the remote session, rather than a local GUI editor over SSH
+// Remote (vscode/cursor, handled by the vscode package).
+const claudeIDEOption = "claude"
+
 // acceleratorProvisioningNotice maps a GPU accelerator type to the upfront notice
 // shown while its serverless compute is provisioned. Latencies vary widely by type
 // (a single A10 is acquired in minutes; an 8xH100 node is ~10 min at P50 and can
@@ -139,8 +144,8 @@ func (o *ClientOptions) Validate() error {
 	if o.ConnectionName != "" && !connectionNameRegex.MatchString(o.ConnectionName) {
 		return fmt.Errorf("connection name %q must consist of letters, numbers, dashes, and underscores", o.ConnectionName)
 	}
-	if o.IDE != "" && o.IDE != vscode.VSCodeOption && o.IDE != vscode.CursorOption {
-		return fmt.Errorf("invalid IDE value: %q, expected %q or %q", o.IDE, vscode.VSCodeOption, vscode.CursorOption)
+	if o.IDE != "" && !o.isGUIIDE() && o.IDE != claudeIDEOption {
+		return fmt.Errorf("invalid IDE value: %q, expected %q, %q, or %q", o.IDE, vscode.VSCodeOption, vscode.CursorOption, claudeIDEOption)
 	}
 	if o.EnvironmentVersion > 0 && o.EnvironmentVersion < minEnvironmentVersion {
 		return fmt.Errorf("environment version must be >= %d, got %d", minEnvironmentVersion, o.EnvironmentVersion)
@@ -180,6 +185,13 @@ func GenerateDefaultConnectionName(host, accelerator, baseEnvironment string) st
 
 func (o *ClientOptions) IsServerlessMode() bool {
 	return o.ClusterID == "" && o.ConnectionName != ""
+}
+
+// isGUIIDE reports whether --ide selects a local GUI editor launched over SSH
+// Remote (handled by the vscode package). Claude Code is not a GUI IDE — it
+// runs as a terminal agent inside the remote session via the shell path.
+func (o *ClientOptions) isGUIIDE() bool {
+	return o.IDE == vscode.VSCodeOption || o.IDE == vscode.CursorOption
 }
 
 // SessionIdentifier returns the unique identifier for the session.
@@ -279,7 +291,9 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 		cmdio.LogString(ctx, fmt.Sprintf("Connecting to %s...", sessionID))
 	}
 
-	if opts.IDE != "" && !opts.ProxyMode {
+	// GUI IDEs (vscode/cursor) need their local binary + SSH extension checked.
+	// Claude Code runs inside the remote session, so it skips these client-side checks.
+	if opts.isGUIIDE() && !opts.ProxyMode {
 		if err := vscode.CheckIDECommand(opts.IDE); err != nil {
 			return err
 		}
@@ -292,7 +306,7 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 	// desired server ports (or socket connection mode) for the connection to go through
 	// (as the majority of the localhost ports on the remote side are blocked by iptable rules).
 	// Plus the platform (always linux), and extensions (python and jupyter), to make the initial experience smoother.
-	if opts.IDE != "" && opts.IsServerlessMode() && !opts.ProxyMode && !opts.SkipSettingsCheck {
+	if opts.isGUIIDE() && opts.IsServerlessMode() && !opts.ProxyMode && !opts.SkipSettingsCheck {
 		err := vscode.CheckAndUpdateSettings(ctx, opts.IDE, opts.ConnectionName, opts.AutoApprove)
 		if err != nil {
 			cmdio.LogString(ctx, fmt.Sprintf("Failed to update IDE settings: %v", err))
@@ -420,9 +434,11 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 
 	if opts.ProxyMode {
 		return runSSHProxy(ctx, client, serverPort, clusterID, opts)
-	} else if opts.IDE != "" {
+	} else if opts.isGUIIDE() {
 		return runIDE(ctx, client, userName, keyPath, serverPort, clusterID, opts)
 	} else {
+		// Default shell and --ide claude both land here: spawn an interactive SSH
+		// session whose remote command is chosen by buildRemoteShellArgs.
 		log.Infof(ctx, "Additional SSH arguments: %v", opts.AdditionalArgs)
 		return spawnSSHClient(ctx, client, userName, keyPath, serverPort, clusterID, opts)
 	}
@@ -751,6 +767,49 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// claudeRemoteBootstrap returns the remote command for --ide claude: install
+// Claude Code (+ uv + the env-aware ucode launcher) if they aren't already
+// present, write an environment-context file, then launch Claude Code with that
+// context appended to its system prompt. ucode points Claude Code at the
+// workspace AI Gateway using the DATABRICKS_HOST / DATABRICKS_TOKEN the server
+// already injects into the session env, so no auth or model wiring is needed
+// here. Each `command -v` guard makes the script idempotent, so reconnects skip
+// installation.
+//
+// wsHome is the user's workspace home (/Workspace/Users/<email>) when it could
+// be resolved, else empty; it is woven into the context so the agent knows its
+// working directory.
+func claudeRemoteBootstrap(wsHome string) string {
+	cwd := "the user's Databricks workspace home directory"
+	if wsHome != "" {
+		cwd = wsHome
+	}
+	systemContext := fmt.Sprintf(`You are running inside a "databricks ssh connect" session on the driver node of a
+Databricks serverless cluster.
+- The "databricks" CLI is installed and already authenticated: DATABRICKS_HOST and
+  DATABRICKS_TOKEN are set in the environment, so "databricks ..." commands work with no
+  "databricks auth login". The same token governs Unity Catalog and serving-endpoint access.
+- This container is ephemeral; only paths under /Workspace persist across sessions. Your
+  working directory is %s.
+- DATABRICKS_TOKEN is a static session token that may expire during a long session; if
+  "databricks" calls start failing with auth errors, the session likely needs reconnecting.
+- You can run shell commands and use the "databricks" CLI to explore the workspace
+  (clusters, jobs, Unity Catalog, DBFS, etc.).
+- If the user asks to set up a new project, suggest scaffolding it with "databricks bundle
+  init" (Databricks Asset Bundles / DABs). If the project needs any resources deployed
+  (jobs, pipelines, serving endpoints, etc.), define them in the bundle and deploy via
+  "databricks bundle deploy" rather than creating them ad hoc.`, cwd)
+
+	return fmt.Sprintf(`export PATH="$HOME/.local/bin:$PATH"
+command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash
+command -v uv     >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+command -v ucode  >/dev/null 2>&1 || uv tool install git+https://github.com/anton-107/ucode@remote-env-token-auth
+cat > "$HOME/.ucode-claude-context.md" <<'CTX'
+%s
+CTX
+exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md"`, systemContext)
+}
+
 // buildRemoteShellArgs returns the ssh arguments that follow the hostname.
 //
 // For the interactive case (no remote command given), it forces PTY allocation
@@ -762,9 +821,10 @@ func shellSingleQuote(s string) string {
 // would resolve to the system interpreter instead of $DATABRICKS_VIRTUAL_ENV. Using
 // -i avoids that reset; the server's ~/.bashrc snippet (see seedEnvActivation) then
 // re-prepends the environment bin after /etc/bash.bashrc runs, so bare `python`/`pip`
-// resolve to the environment interpreter. When wsHome is set, the shell first changes
-// into the user's workspace home folder; if that directory is missing the cd is
-// ignored and the shell still launches from $HOME.
+// resolve to the environment interpreter. With --ide claude it instead bootstraps
+// and launches Claude Code (see claudeRemoteBootstrap). When wsHome is set, the
+// command first changes into the user's workspace home folder; if that directory
+// is missing the cd is ignored and it still runs from $HOME.
 //
 // For the non-interactive case (e.g. `databricks ssh connect ... -- ls -la`),
 // the user's command is returned verbatim so behavior is unchanged.
@@ -777,6 +837,9 @@ func buildRemoteShellArgs(opts ClientOptions, wsHome string) []string {
 		return opts.AdditionalArgs
 	}
 	cmd := `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
+	if opts.IDE == claudeIDEOption {
+		cmd = claudeRemoteBootstrap(wsHome)
+	}
 	if wsHome != "" {
 		cmd = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + cmd
 	}
