@@ -373,12 +373,16 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "", "")
 		require.Len(t, args, 1)
 		assert.Equal(t, claudeRemoteBootstrap("", ""), args[0])
-		assert.Contains(t, args[0], "exec ucode claude --append-system-prompt-file")
+		assert.Contains(t, args[0], "ucode claude --append-system-prompt-file")
 		assert.Contains(t, args[0], "Databricks serverless cluster")
 		assert.NotContains(t, args[0], "exec bash")
 		// Without --ucode-source, ucode installs from the published GitHub build.
 		assert.Contains(t, args[0], "uv tool install git+https://github.com/anton-107/ucode")
 		assert.NotContains(t, args[0], "--reinstall")
+		// Node/npm is fetched into a non-PATH dir and prepended only for ucode.
+		assert.Contains(t, args[0], "command -v npm")
+		assert.Contains(t, args[0], "https://nodejs.org/dist/latest-krypton")
+		assert.Contains(t, args[0], `exec env PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode claude`)
 	})
 
 	t.Run("ide claude cds into workspace home and weaves it into context", func(t *testing.T) {

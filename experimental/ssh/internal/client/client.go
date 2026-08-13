@@ -835,13 +835,12 @@ func buildAndUploadUcode(ctx context.Context, client *databricks.WorkspaceClient
 }
 
 // claudeRemoteBootstrap returns the remote command for --ide claude: install
-// Claude Code (+ uv + the env-aware ucode launcher) if they aren't already
-// present, write an environment-context file, then launch Claude Code with that
-// context appended to its system prompt. ucode points Claude Code at the
-// workspace AI Gateway using the DATABRICKS_HOST / DATABRICKS_TOKEN the server
-// already injects into the session env, so no auth or model wiring is needed
-// here. Each `command -v` guard makes the script idempotent, so reconnects skip
-// installation.
+// Claude Code (+ uv + the env-aware ucode launcher, and Node/npm which Claude
+// Code needs) if they aren't already present, write an environment-context file,
+// then launch Claude Code with that context appended to its system prompt. ucode
+// points Claude Code at the workspace AI Gateway using the DATABRICKS_HOST /
+// DATABRICKS_TOKEN the server already injects into the session env, so no auth or
+// model wiring is needed here. Each install is guarded, so reconnects skip it.
 //
 // wsHome is the user's workspace home (/Workspace/Users/<email>) when it could
 // be resolved, else empty; it is woven into the context so the agent knows its
@@ -879,11 +878,31 @@ Databricks serverless cluster.
 	return fmt.Sprintf(`export PATH="$HOME/.local/bin:$PATH"
 command -v uv     >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 %s
+# Claude Code needs Node/npm. Serverless images don't ship it, so if npm is
+# missing fetch the latest Krypton LTS build into a non-PATH dir and prepend it
+# only for the ucode invocations below — we never mutate the system PATH. The
+# $NODE_DIR/bin/npm check keeps this idempotent so a warm reconnect skips it.
+NPM_PATH=""
+if ! command -v npm >/dev/null 2>&1; then
+  NODE_DIR="$HOME/.ucode-node"
+  if [ ! -x "$NODE_DIR/bin/npm" ]; then
+    case "$(uname -m)" in
+      x86_64|amd64) node_arch=x64 ;;
+      aarch64|arm64) node_arch=arm64 ;;
+      *) node_arch=$(uname -m) ;;
+    esac
+    node_base="https://nodejs.org/dist/latest-krypton"
+    node_tar=$(curl -fsSL "$node_base/SHASUMS256.txt" | grep -o "node-v[0-9.]*-linux-${node_arch}\.tar\.xz" | head -n1)
+    mkdir -p "$NODE_DIR"
+    curl -fsSL "$node_base/$node_tar" | tar -xJ --strip-components=1 -C "$NODE_DIR" -f -
+  fi
+  NPM_PATH="$NODE_DIR/bin"
+fi
 cat > "$HOME/.ucode-claude-context.md" <<'CTX'
 %s
 CTX
-ucode configure --agent claude --enable-databricks-ai-tools --skip-validate
-exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md"`, ucodeInstall, systemContext)
+PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode configure --agent claude --enable-databricks-ai-tools --skip-validate
+exec env PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md"`, ucodeInstall, systemContext)
 }
 
 // buildRemoteShellArgs returns the ssh arguments that follow the hostname.
