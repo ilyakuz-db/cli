@@ -1,0 +1,1 @@
+* `databricks ssh connect` interactive sessions now install a `claude` launcher on the remote PATH. The first `claude` invocation installs ucode + Claude Code (and Node/npm) and configures it against the session's workspace; subsequent runs delegate to `ucode claude`, giving a ucode-configured Claude Code in any session with no extra flags.

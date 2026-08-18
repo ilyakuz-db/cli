@@ -55,11 +55,6 @@ const (
 	minEnvironmentVersion    = 4
 )
 
-// claudeIDEOption is the --ide value that launches Claude Code as a terminal
-// agent *inside* the remote session, rather than a local GUI editor over SSH
-// Remote (vscode/cursor, handled by the vscode package).
-const claudeIDEOption = "claude"
-
 // acceleratorProvisioningNotice maps a GPU accelerator type to the upfront notice
 // shown while its serverless compute is provisioned. Latencies vary widely by type
 // (a single A10 is acquired in minutes; an 8xH100 node is ~10 min at P50 and can
@@ -148,11 +143,13 @@ func (o *ClientOptions) Validate() error {
 	if o.ConnectionName != "" && !connectionNameRegex.MatchString(o.ConnectionName) {
 		return fmt.Errorf("connection name %q must consist of letters, numbers, dashes, and underscores", o.ConnectionName)
 	}
-	if o.IDE != "" && !o.isGUIIDE() && o.IDE != claudeIDEOption {
-		return fmt.Errorf("invalid IDE value: %q, expected %q, %q, or %q", o.IDE, vscode.VSCodeOption, vscode.CursorOption, claudeIDEOption)
+	if o.IDE != "" && o.IDE != vscode.VSCodeOption && o.IDE != vscode.CursorOption {
+		return fmt.Errorf("invalid IDE value: %q, expected %q or %q", o.IDE, vscode.VSCodeOption, vscode.CursorOption)
 	}
-	if o.UcodeSource != "" && o.IDE != claudeIDEOption {
-		return fmt.Errorf("--ucode-source can only be used with --ide %s", claudeIDEOption)
+	// --ucode-source only feeds the default shell session's `claude` launcher, which
+	// isn't installed on the GUI (vscode/cursor) path, so reject the combination.
+	if o.UcodeSource != "" && o.IDE != "" {
+		return fmt.Errorf("--ucode-source cannot be used with --ide %q; it only applies to the default shell session", o.IDE)
 	}
 	if o.EnvironmentVersion > 0 && o.EnvironmentVersion < minEnvironmentVersion {
 		return fmt.Errorf("environment version must be >= %d, got %d", minEnvironmentVersion, o.EnvironmentVersion)
@@ -192,13 +189,6 @@ func GenerateDefaultConnectionName(host, accelerator, baseEnvironment string) st
 
 func (o *ClientOptions) IsServerlessMode() bool {
 	return o.ClusterID == "" && o.ConnectionName != ""
-}
-
-// isGUIIDE reports whether --ide selects a local GUI editor launched over SSH
-// Remote (handled by the vscode package). Claude Code is not a GUI IDE — it
-// runs as a terminal agent inside the remote session via the shell path.
-func (o *ClientOptions) isGUIIDE() bool {
-	return o.IDE == vscode.VSCodeOption || o.IDE == vscode.CursorOption
 }
 
 // SessionIdentifier returns the unique identifier for the session.
@@ -298,9 +288,7 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 		cmdio.LogString(ctx, fmt.Sprintf("Connecting to %s...", sessionID))
 	}
 
-	// GUI IDEs (vscode/cursor) need their local binary + SSH extension checked.
-	// Claude Code runs inside the remote session, so it skips these client-side checks.
-	if opts.isGUIIDE() && !opts.ProxyMode {
+	if opts.IDE != "" && !opts.ProxyMode {
 		if err := vscode.CheckIDECommand(opts.IDE); err != nil {
 			return err
 		}
@@ -313,7 +301,7 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 	// desired server ports (or socket connection mode) for the connection to go through
 	// (as the majority of the localhost ports on the remote side are blocked by iptable rules).
 	// Plus the platform (always linux), and extensions (python and jupyter), to make the initial experience smoother.
-	if opts.isGUIIDE() && opts.IsServerlessMode() && !opts.ProxyMode && !opts.SkipSettingsCheck {
+	if opts.IDE != "" && opts.IsServerlessMode() && !opts.ProxyMode && !opts.SkipSettingsCheck {
 		err := vscode.CheckAndUpdateSettings(ctx, opts.IDE, opts.ConnectionName, opts.AutoApprove)
 		if err != nil {
 			cmdio.LogString(ctx, fmt.Sprintf("Failed to update IDE settings: %v", err))
@@ -441,11 +429,11 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 
 	if opts.ProxyMode {
 		return runSSHProxy(ctx, client, serverPort, clusterID, opts)
-	} else if opts.isGUIIDE() {
+	} else if opts.IDE != "" {
 		return runIDE(ctx, client, userName, keyPath, serverPort, clusterID, opts)
 	} else {
-		// Default shell and --ide claude both land here: spawn an interactive SSH
-		// session whose remote command is chosen by buildRemoteShellArgs.
+		// Default shell session: spawnSSHClient drops a `claude` launcher onto PATH
+		// (see buildRemoteShellArgs) and opens an interactive bash.
 		log.Infof(ctx, "Additional SSH arguments: %v", opts.AdditionalArgs)
 		return spawnSSHClient(ctx, client, userName, keyPath, serverPort, clusterID, opts)
 	}
@@ -834,28 +822,37 @@ func buildAndUploadUcode(ctx context.Context, client *databricks.WorkspaceClient
 	return uploadDir + "/" + sdistName, nil
 }
 
-// claudeRemoteBootstrap returns the remote command for --ide claude: install
-// Claude Code (+ uv + the env-aware ucode launcher, and Node/npm which Claude
-// Code needs) if they aren't already present, write an environment-context file,
-// then launch Claude Code with that context appended to its system prompt. ucode
-// points Claude Code at the workspace AI Gateway using the DATABRICKS_HOST /
-// DATABRICKS_TOKEN the server already injects into the session env, so no auth or
-// model wiring is needed here. Each install is guarded, so reconnects skip it.
+// claudeShimDir is the PATH directory the interactive session drops the `claude`
+// launcher into. It's dedicated (not $HOME/bin) so an npm global install can
+// never overwrite the shim, and the re-entry guard can exclude exactly this dir.
+const claudeShimDir = "$HOME/.ucode-shim"
+
+// claudeStub returns the contents of the `claude` launcher installed onto the
+// remote PATH for every interactive session. Running `claude` the first time
+// installs uv + the env-aware ucode launcher (and Node/npm, which Claude Code
+// needs) and configures Claude Code against the session's workspace; every run
+// then delegates to `ucode claude`. ucode points Claude Code at the workspace AI
+// Gateway using the DATABRICKS_HOST / DATABRICKS_TOKEN the server injects, so no
+// auth or model wiring is needed here. Each install is guarded so later runs skip
+// straight to the launch.
 //
-// wsHome is the user's workspace home (/Workspace/Users/<email>) when it could
-// be resolved, else empty; it is woven into the context so the agent knows its
-// working directory.
+// Recursion guard: `ucode claude` execs the real `claude` via a PATH lookup
+// (os.execvp), which finds this shim again. The shim sets UCODE_CLAUDE_SHIM before
+// delegating; on re-entry it execs the first real claude on PATH that isn't in
+// claudeShimDir, breaking the loop regardless of where npm installed claude.
 //
-// ucodeRemotePath, when set, is the /Workspace path of a locally-built ucode
-// sdist uploaded by --ucode-source; ucode is then force-reinstalled from it
-// (rather than the published GitHub build) so iterating on a local ucode branch
-// takes effect even on a warm reconnect where ucode is already installed.
-func claudeRemoteBootstrap(wsHome, ucodeRemotePath string) string {
+// wsHome is the user's workspace home (/Workspace/Users/<email>) when it could be
+// resolved, else empty; it is woven into the context so the agent knows its
+// working directory. ucodeRemotePath, when set, is the /Workspace path of a
+// locally-built ucode sdist uploaded by --ucode-source; ucode is force-reinstalled
+// from it (rather than the published GitHub build) so iterating on a local ucode
+// branch takes effect.
+func claudeStub(wsHome, ucodeRemotePath string) string {
 	cwd := "the user's Databricks workspace home directory"
 	if wsHome != "" {
 		cwd = wsHome
 	}
-	ucodeInstall := `command -v ucode  >/dev/null 2>&1 || uv tool install git+https://github.com/anton-107/ucode@remote-env-token-auth`
+	ucodeInstall := `command -v ucode >/dev/null 2>&1 || uv tool install git+https://github.com/anton-107/ucode@remote-env-token-auth`
 	if ucodeRemotePath != "" {
 		ucodeInstall = "uv tool install --reinstall " + shellSingleQuote(ucodeRemotePath)
 	}
@@ -875,14 +872,30 @@ Databricks serverless cluster.
   (jobs, pipelines, serving endpoints, etc.), define them in the bundle and deploy via
   "databricks bundle deploy" rather than creating them ad hoc.`, cwd)
 
-	return fmt.Sprintf(`export PATH="$HOME/.local/bin:$PATH"
-command -v uv     >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+	return fmt.Sprintf(`#!/usr/bin/env bash
+# ucode "claude" launcher, installed on PATH by "databricks ssh connect".
+# First run bootstraps ucode + Claude Code; every run delegates to "ucode claude".
+SHIM_DIR="%s"
+
+# ucode claude execs the real claude via a PATH lookup, which finds this shim
+# again. On re-entry, hand off to the first real claude on PATH that isn't us.
+if [ -n "$UCODE_CLAUDE_SHIM" ]; then
+  IFS=:
+  for d in $PATH; do
+    if [ "$d" != "$SHIM_DIR" ] && [ -x "$d/claude" ]; then exec "$d/claude" "$@"; fi
+  done
+  echo "claude: ucode shim could not find the real claude binary on PATH" >&2
+  exit 127
+fi
+export UCODE_CLAUDE_SHIM=1
+export PATH="$HOME/.local/bin:$PATH"
+
+command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 %s
-# Claude Code needs Node/npm. Serverless images don't ship it, so if npm is
-# missing fetch the latest Krypton LTS build into a non-PATH dir and prepend it
-# only for the ucode invocations below — we never mutate the system PATH. The
-# $NODE_DIR/bin/npm check keeps this idempotent so a warm reconnect skips it.
-NPM_PATH=""
+
+# Claude Code needs Node/npm; serverless images don't ship it. Fetch the latest
+# Krypton LTS build into a non-PATH dir and prepend it. The $NODE_DIR/bin/npm
+# check keeps this idempotent so later runs skip the download.
 if ! command -v npm >/dev/null 2>&1; then
   NODE_DIR="$HOME/.ucode-node"
   if [ ! -x "$NODE_DIR/bin/npm" ]; then
@@ -896,13 +909,19 @@ if ! command -v npm >/dev/null 2>&1; then
     mkdir -p "$NODE_DIR"
     curl -fsSL "$node_base/$node_tar" | tar -xJ --strip-components=1 -C "$NODE_DIR" -f -
   fi
-  NPM_PATH="$NODE_DIR/bin"
+  export PATH="$NODE_DIR/bin:$PATH"
 fi
-cat > "$HOME/.ucode-claude-context.md" <<'CTX'
+
+# Configure Claude Code against the session's workspace once (the marker keeps
+# later runs on the fast path: just "ucode claude").
+if [ ! -f "$SHIM_DIR/.configured" ]; then
+  cat > "$HOME/.ucode-claude-context.md" <<'CTX'
 %s
 CTX
-PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode configure --agent claude --enable-databricks-ai-tools --skip-validate
-exec env PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md"`, ucodeInstall, systemContext)
+  ucode configure --agent claude --enable-databricks-ai-tools --skip-validate && touch "$SHIM_DIR/.configured"
+fi
+
+exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "$@"`, claudeShimDir, ucodeInstall, systemContext)
 }
 
 // buildRemoteShellArgs returns the ssh arguments that follow the hostname.
@@ -916,10 +935,11 @@ exec env PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode claude --append-system-prompt
 // would resolve to the system interpreter instead of $DATABRICKS_VIRTUAL_ENV. Using
 // -i avoids that reset; the server's ~/.bashrc snippet (see seedEnvActivation) then
 // re-prepends the environment bin after /etc/bash.bashrc runs, so bare `python`/`pip`
-// resolve to the environment interpreter. With --ide claude it instead bootstraps
-// and launches Claude Code (see claudeRemoteBootstrap). When wsHome is set, the
-// command first changes into the user's workspace home folder; if that directory
-// is missing the cd is ignored and it still runs from $HOME.
+// resolve to the environment interpreter. Before launching bash it installs the
+// `claude` launcher (see claudeStub) into a PATH dir, so `claude` is available in
+// any interactive session. When wsHome is set, the command first changes into the
+// user's workspace home folder; if that directory is missing the cd is ignored and
+// it still runs from $HOME.
 //
 // For the non-interactive case (e.g. `databricks ssh connect ... -- ls -la`),
 // the user's command is returned verbatim so behavior is unchanged.
@@ -931,14 +951,21 @@ func buildRemoteShellArgs(opts ClientOptions, wsHome, ucodeRemotePath string) []
 	if len(opts.AdditionalArgs) > 0 {
 		return opts.AdditionalArgs
 	}
-	cmd := `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
-	if opts.IDE == claudeIDEOption {
-		cmd = claudeRemoteBootstrap(wsHome, ucodeRemotePath)
-	}
+	// Install the `claude` launcher onto PATH, then open the shell. The shim file
+	// is written via a quoted heredoc so its own $VARS and inner heredoc are stored
+	// verbatim rather than expanded here.
+	cmd := fmt.Sprintf(`mkdir -p "%[1]s"
+cat > "%[1]s/claude" <<'UCODE_CLAUDE_SHIM_EOF'
+%[2]s
+UCODE_CLAUDE_SHIM_EOF
+chmod +x "%[1]s/claude"
+export PATH="%[1]s:$PATH"
+`, claudeShimDir, claudeStub(wsHome, ucodeRemotePath))
+	shell := `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
 	if wsHome != "" {
-		cmd = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + cmd
+		shell = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + shell
 	}
-	return []string{cmd}
+	return []string{cmd + shell}
 }
 
 // buildSSHArgs assembles the argument list for the ssh client. Options come
@@ -990,12 +1017,13 @@ func spawnSSHClient(ctx context.Context, client *databricks.WorkspaceClient, use
 		}
 	}
 
-	// --ide claude with --ucode-source: build the local ucode branch into an sdist
-	// and upload it to the workspace, so the remote installs that instead of the
-	// published GitHub build. The workspace tree is FUSE-mounted on the driver, so
-	// the returned /Workspace path is directly installable there.
+	// --ucode-source: build the local ucode branch into an sdist and upload it to
+	// the workspace, so the claude launcher installs that instead of the published
+	// GitHub build. The workspace tree is FUSE-mounted on the driver, so the
+	// returned /Workspace path is directly installable there. Only relevant for an
+	// interactive session (where the launcher is written), matching wsHome above.
 	var ucodeRemotePath string
-	if opts.IDE == claudeIDEOption && opts.UcodeSource != "" {
+	if opts.UcodeSource != "" && len(opts.AdditionalArgs) == 0 {
 		ucodeRemotePath, err = buildAndUploadUcode(ctx, client, opts.UcodeSource, wsHome)
 		if err != nil {
 			return fmt.Errorf("failed to prepare ucode from --ucode-source: %w", err)

@@ -75,7 +75,7 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "invalid IDE value",
 			opts:    client.ClientOptions{ClusterID: "abc-123", IDE: "vim"},
-			wantErr: `invalid IDE value: "vim", expected "vscode", "cursor", or "claude"`,
+			wantErr: `invalid IDE value: "vim", expected "vscode" or "cursor"`,
 		},
 		{
 			name: "valid IDE vscode",
@@ -86,22 +86,13 @@ func TestValidate(t *testing.T) {
 			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "cursor"},
 		},
 		{
-			name: "valid IDE claude",
-			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "claude"},
-		},
-		{
-			name:    "ucode source without ide claude",
-			opts:    client.ClientOptions{ClusterID: "abc-123", UcodeSource: "/local/ucode"},
-			wantErr: "--ucode-source can only be used with --ide claude",
-		},
-		{
 			name:    "ucode source with ide vscode",
 			opts:    client.ClientOptions{ClusterID: "abc-123", IDE: "vscode", UcodeSource: "/local/ucode"},
-			wantErr: "--ucode-source can only be used with --ide claude",
+			wantErr: `--ucode-source cannot be used with --ide "vscode"; it only applies to the default shell session`,
 		},
 		{
-			name: "valid ucode source with ide claude",
-			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "claude", UcodeSource: "/local/ucode"},
+			name: "valid ucode source on the default shell session",
+			opts: client.ClientOptions{ClusterID: "abc-123", UcodeSource: "/local/ucode"},
 		},
 		{
 			name:    "environment version too low",

@@ -351,16 +351,24 @@ func TestHostKeyChangedHint(t *testing.T) {
 func TestBuildRemoteShellArgs(t *testing.T) {
 	const bashCmd = `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
 
-	t.Run("interactive returns non-login bash command", func(t *testing.T) {
+	t.Run("interactive installs the claude launcher then opens bash", func(t *testing.T) {
 		args := buildRemoteShellArgs(ClientOptions{}, "", "")
 		require.Len(t, args, 1)
-		assert.Equal(t, bashCmd, args[0])
+		// The claude launcher is written to a PATH dir before the shell opens.
+		assert.Contains(t, args[0], `cat > "$HOME/.ucode-shim/claude"`)
+		assert.Contains(t, args[0], `export PATH="$HOME/.ucode-shim:$PATH"`)
+		assert.Contains(t, args[0], claudeStub("", ""))
+		// The interactive shell is the last thing the command does.
+		assert.True(t, strings.HasSuffix(args[0], bashCmd))
 	})
 
 	t.Run("interactive cds into workspace home when set", func(t *testing.T) {
-		args := buildRemoteShellArgs(ClientOptions{}, "/Workspace/Users/me@example.com", "")
+		const wsHome = "/Workspace/Users/me@example.com"
+		args := buildRemoteShellArgs(ClientOptions{}, wsHome, "")
 		require.Len(t, args, 1)
-		assert.Equal(t, `cd '/Workspace/Users/me@example.com' 2>/dev/null; `+bashCmd, args[0])
+		// The launcher is still installed; the cd precedes the shell launch.
+		assert.Contains(t, args[0], claudeStub(wsHome, ""))
+		assert.True(t, strings.HasSuffix(args[0], `cd '`+wsHome+`' 2>/dev/null; `+bashCmd))
 	})
 
 	t.Run("non-interactive passes additional args verbatim", func(t *testing.T) {
@@ -368,53 +376,38 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com", "")
 		assert.Equal(t, additional, args)
 	})
-
-	t.Run("ide claude bootstraps and launches ucode with context", func(t *testing.T) {
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "", "")
-		require.Len(t, args, 1)
-		assert.Equal(t, claudeRemoteBootstrap("", ""), args[0])
-		assert.Contains(t, args[0], "ucode claude --append-system-prompt-file")
-		assert.Contains(t, args[0], "Databricks serverless cluster")
-		assert.NotContains(t, args[0], "exec bash")
-		// Without --ucode-source, ucode installs from the published GitHub build.
-		assert.Contains(t, args[0], "uv tool install git+https://github.com/anton-107/ucode")
-		assert.NotContains(t, args[0], "--reinstall")
-		// Node/npm is fetched into a non-PATH dir and prepended only for ucode.
-		assert.Contains(t, args[0], "command -v npm")
-		assert.Contains(t, args[0], "https://nodejs.org/dist/latest-krypton")
-		assert.Contains(t, args[0], `exec env PATH="${NPM_PATH:+$NPM_PATH:}$PATH" ucode claude`)
-	})
-
-	t.Run("ide claude cds into workspace home and weaves it into context", func(t *testing.T) {
-		const wsHome = "/Workspace/Users/me@example.com"
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, wsHome, "")
-		require.Len(t, args, 1)
-		assert.Equal(t, `cd '`+wsHome+`' 2>/dev/null; `+claudeRemoteBootstrap(wsHome, ""), args[0])
-		// The resolved workspace home is interpolated into the system-prompt context.
-		assert.Contains(t, args[0], "working directory is "+wsHome)
-	})
-
-	t.Run("ide claude with ucode source force-reinstalls from the workspace path", func(t *testing.T) {
-		const ucodePath = "/Workspace/Users/me@example.com/.databricks/ssh-tunnel/ucode/ucode-0.1.0.tar.gz"
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption}, "", ucodePath)
-		require.Len(t, args, 1)
-		// The local build is force-reinstalled from the uploaded sdist, not GitHub.
-		assert.Contains(t, args[0], "uv tool install --reinstall '"+ucodePath+"'")
-		assert.NotContains(t, args[0], "git+https://github.com/anton-107/ucode")
-	})
-
-	t.Run("ide claude with additional args passes them verbatim", func(t *testing.T) {
-		additional := []string{"echo", "hi"}
-		args := buildRemoteShellArgs(ClientOptions{IDE: claudeIDEOption, AdditionalArgs: additional}, "", "")
-		assert.Equal(t, additional, args)
-	})
 }
 
-func TestIsGUIIDE(t *testing.T) {
-	assert.True(t, (&ClientOptions{IDE: "vscode"}).isGUIIDE())
-	assert.True(t, (&ClientOptions{IDE: "cursor"}).isGUIIDE())
-	assert.False(t, (&ClientOptions{IDE: "claude"}).isGUIIDE())
-	assert.False(t, (&ClientOptions{IDE: ""}).isGUIIDE())
+func TestClaudeStub(t *testing.T) {
+	t.Run("bootstraps then delegates to ucode claude", func(t *testing.T) {
+		stub := claudeStub("", "")
+		assert.True(t, strings.HasPrefix(stub, "#!/usr/bin/env bash"))
+		// Re-entry guard: `ucode claude` execs claude via PATH and finds this shim
+		// again; the guard hands off to the real binary instead of looping.
+		assert.Contains(t, stub, `if [ -n "$UCODE_CLAUDE_SHIM" ]; then`)
+		assert.Contains(t, stub, "export UCODE_CLAUDE_SHIM=1")
+		// Default: install ucode from the published GitHub build.
+		assert.Contains(t, stub, "uv tool install git+https://github.com/anton-107/ucode")
+		assert.NotContains(t, stub, "--reinstall")
+		// Node/npm bootstrap from the Krypton LTS line.
+		assert.Contains(t, stub, "command -v npm")
+		assert.Contains(t, stub, "https://nodejs.org/dist/latest-krypton")
+		// Configure once (guarded), then delegate on every run.
+		assert.Contains(t, stub, "ucode configure --agent claude --enable-databricks-ai-tools --skip-validate")
+		assert.Contains(t, stub, `exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "$@"`)
+	})
+
+	t.Run("weaves the workspace home into the context", func(t *testing.T) {
+		const wsHome = "/Workspace/Users/me@example.com"
+		assert.Contains(t, claudeStub(wsHome, ""), "working directory is "+wsHome)
+	})
+
+	t.Run("ucode source force-reinstalls from the uploaded sdist", func(t *testing.T) {
+		const ucodePath = "/Workspace/Users/me@example.com/.databricks/ssh-tunnel/ucode/ucode-0.1.0.tar.gz"
+		stub := claudeStub("", ucodePath)
+		assert.Contains(t, stub, "uv tool install --reinstall '"+ucodePath+"'")
+		assert.NotContains(t, stub, "git+https://github.com/anton-107/ucode")
+	})
 }
 
 func TestBuildSSHArgsPTYPlacement(t *testing.T) {

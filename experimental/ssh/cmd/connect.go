@@ -51,7 +51,7 @@ Connect to a dedicated cluster:
 
 	cmd.Flags().StringVar(&connectionName, "name", "", "Connection name to reuse across sessions (serverless only)")
 	cmd.Flags().StringVar(&accelerator, "accelerator", "", "Serverless GPU accelerator type (GPU_1xA10 or GPU_8xH100)")
-	cmd.Flags().StringVar(&ide, "ide", "", "Open a remote IDE or agent (vscode, cursor, or claude)")
+	cmd.Flags().StringVar(&ide, "ide", "", "Open a remote IDE window (vscode or cursor)")
 	cmd.Flags().StringVar(&usagePolicyID, "usage-policy-id", "", "Usage policy ID for the serverless SSH server job (serverless only)")
 
 	cmd.Flags().BoolVar(&proxyMode, "proxy", false, "ProxyCommand mode")
@@ -64,7 +64,7 @@ Connect to a dedicated cluster:
 	cmd.Flags().StringVar(&releasesDir, "releases-dir", "", "Directory for local SSH tunnel development releases")
 	cmd.Flags().MarkHidden("releases-dir")
 
-	cmd.Flags().StringVar(&ucodeSource, "ucode-source", "", "Local ucode source directory to build and use with --ide claude, instead of the published GitHub build (dev/test only)")
+	cmd.Flags().StringVar(&ucodeSource, "ucode-source", "", "Local ucode source directory to build and use in the session's claude launcher, instead of the published GitHub build (dev/test only)")
 	cmd.Flags().MarkHidden("ucode-source")
 
 	cmd.Flags().StringVar(&userKnownHostsFile, "user-known-hosts-file", "", "Path to user known hosts file for SSH client")
