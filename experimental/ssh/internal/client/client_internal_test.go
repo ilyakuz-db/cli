@@ -395,6 +395,10 @@ func TestClaudeStub(t *testing.T) {
 		// npm's global bin goes on PATH so the npm-installed claude resolves.
 		assert.Contains(t, stub, "npm prefix -g")
 		assert.Contains(t, stub, `export PATH="$npm_prefix/bin:$PATH"`)
+		// The shim drops its own dir from PATH before delegating, so ucode installs
+		// (and execs) the real claude instead of seeing this shim and skipping it.
+		assert.Contains(t, stub, `[ "$d" = "$SHIM_DIR" ] || _clean_path=`)
+		assert.Contains(t, stub, `export PATH="$_clean_path"`)
 		// Configure once (guarded), then delegate on every run.
 		assert.Contains(t, stub, "ucode configure --agent claude --enable-databricks-ai-tools --skip-validate")
 		assert.Contains(t, stub, `exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "$@"`)

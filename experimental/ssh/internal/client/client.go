@@ -877,8 +877,10 @@ Databricks serverless cluster.
 # First run bootstraps ucode + Claude Code; every run delegates to "ucode claude".
 SHIM_DIR="%s"
 
-# ucode claude execs the real claude via a PATH lookup, which finds this shim
-# again. On re-entry, hand off to the first real claude on PATH that isn't us.
+# Recursion safety net: we drop this shim's dir from PATH before handing off to
+# "ucode claude" below, so ucode should never exec back into this shim. If some
+# PATH quirk still routes "claude" here while we are delegating, hand off to the
+# first real claude on PATH rather than looping forever.
 if [ -n "$UCODE_CLAUDE_SHIM" ]; then
   IFS=:
   for d in $PATH; do
@@ -923,6 +925,18 @@ if [ -n "$npm_prefix" ]; then
     *) export PATH="$npm_prefix/bin:$PATH" ;;
   esac
 fi
+
+# ucode installs Claude Code with "npm install -g" only when "claude" isn't already
+# on PATH — but this shim IS a "claude" on PATH, so ucode would think it's installed,
+# skip the install, and exec straight back into this shim. Drop our own dir from PATH
+# before delegating so ucode sees (and installs) the real claude instead.
+_clean_path=""
+IFS=:
+for d in $PATH; do
+  [ "$d" = "$SHIM_DIR" ] || _clean_path="${_clean_path:+$_clean_path:}$d"
+done
+unset IFS
+export PATH="$_clean_path"
 
 # Configure Claude Code against the session's workspace once (the marker keeps
 # later runs on the fast path: just "ucode claude").
