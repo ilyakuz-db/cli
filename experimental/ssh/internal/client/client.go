@@ -912,6 +912,18 @@ if ! command -v npm >/dev/null 2>&1; then
   export PATH="$NODE_DIR/bin:$PATH"
 fi
 
+# ucode installs Claude Code with "npm install -g" and then execs "claude" via a
+# PATH lookup. Put npm's global bin ahead of this shim on PATH so that real binary
+# is found directly — without it, a pre-existing npm whose global bin isn't on PATH
+# leaves the launcher unable to resolve claude after installing.
+npm_prefix=$(npm prefix -g 2>/dev/null)
+if [ -n "$npm_prefix" ]; then
+  case ":$PATH:" in
+    *":$npm_prefix/bin:"*) ;;
+    *) export PATH="$npm_prefix/bin:$PATH" ;;
+  esac
+fi
+
 # Configure Claude Code against the session's workspace once (the marker keeps
 # later runs on the fast path: just "ucode claude").
 if [ ! -f "$SHIM_DIR/.configured" ]; then

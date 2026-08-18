@@ -392,6 +392,9 @@ func TestClaudeStub(t *testing.T) {
 		// Node/npm bootstrap from the Krypton LTS line.
 		assert.Contains(t, stub, "command -v npm")
 		assert.Contains(t, stub, "https://nodejs.org/dist/latest-krypton")
+		// npm's global bin goes on PATH so the npm-installed claude resolves.
+		assert.Contains(t, stub, "npm prefix -g")
+		assert.Contains(t, stub, `export PATH="$npm_prefix/bin:$PATH"`)
 		// Configure once (guarded), then delegate on every run.
 		assert.Contains(t, stub, "ucode configure --agent claude --enable-databricks-ai-tools --skip-validate")
 		assert.Contains(t, stub, `exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "$@"`)
