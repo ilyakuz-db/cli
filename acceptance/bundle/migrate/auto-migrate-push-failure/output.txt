@@ -21,7 +21,7 @@ Resources: 0 created, 0 changed, 0 deleted, 1 unchanged
 
 >>> print_migration_telemetry
 direct_migrate_commit_error true
-direct_migrate_commit_error_template pushing direct state to workspace: %w [INJECTED 403]
+direct_migrate_commit_error_template pushing direct state to workspace: %w [403 INJECTED]
 
 === Local state was NOT rewritten (still terraform)
 
