@@ -354,12 +354,12 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 
 	t.Run("interactive installs the claude launcher, cds home, then opens bash", func(t *testing.T) {
 		const wsHome = "/Workspace/Users/me@example.com"
-		args := buildRemoteShellArgs(ClientOptions{}, wsHome, "", version)
+		args := buildRemoteShellArgs(ClientOptions{}, wsHome, version)
 		require.Len(t, args, 1)
 		// The claude wrapper is written to a PATH dir before the shell opens.
 		assert.Contains(t, args[0], `cat > "$HOME/.ucode-shim/claude"`)
 		assert.Contains(t, args[0], `export PATH="$HOME/.ucode-shim:$PATH"`)
-		assert.Contains(t, args[0], claudeWrapperScript(wsHome, "", version))
+		assert.Contains(t, args[0], claudeWrapperScript(wsHome, version))
 		// The cd into the workspace home precedes the shell launch.
 		assert.True(t, strings.HasSuffix(args[0], `cd '`+wsHome+`' 2>/dev/null; `+bashCmd))
 	})
@@ -367,14 +367,14 @@ func TestBuildRemoteShellArgs(t *testing.T) {
 	t.Run("interactive without a workspace home skips the launcher", func(t *testing.T) {
 		// The wrapper needs the workspace path to locate the uploaded CLI, so when
 		// wsHome couldn't be resolved it's omitted and only the shell opens.
-		args := buildRemoteShellArgs(ClientOptions{}, "", "", version)
+		args := buildRemoteShellArgs(ClientOptions{}, "", version)
 		require.Len(t, args, 1)
 		assert.Equal(t, bashCmd, args[0])
 	})
 
 	t.Run("non-interactive passes additional args verbatim", func(t *testing.T) {
 		additional := []string{"ls", "-la"}
-		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com", "", version)
+		args := buildRemoteShellArgs(ClientOptions{AdditionalArgs: additional}, "/Workspace/Users/me@example.com", version)
 		assert.Equal(t, additional, args)
 	})
 }
@@ -383,7 +383,7 @@ func TestClaudeWrapperScript(t *testing.T) {
 	const wsHome = "/Workspace/Users/me@example.com"
 
 	t.Run("resolves the uploaded binary and delegates to agent-shim", func(t *testing.T) {
-		wrapper := claudeWrapperScript(wsHome, "", "1.2.3")
+		wrapper := claudeWrapperScript(wsHome, "1.2.3")
 		assert.True(t, strings.HasPrefix(wrapper, "#!/usr/bin/env bash"))
 		// Architecture is resolved on the remote via uname -m.
 		assert.Contains(t, wrapper, "case \"$(uname -m)\" in")
@@ -392,19 +392,11 @@ func TestClaudeWrapperScript(t *testing.T) {
 		assert.Contains(t, wrapper, `exec "`+wsHome+`/.databricks/ssh-tunnel/1.2.3/databricks_cli_1.2.3_linux_${_arch}/databricks" ssh agent-shim claude "$@"`)
 		// The workspace home is forwarded so the shim can name the working directory.
 		assert.Contains(t, wrapper, "export "+workspaceHomeEnv+"='"+wsHome+"'")
-		// No ucode source override by default.
-		assert.NotContains(t, wrapper, ucodeSourceEnv)
 	})
 
 	t.Run("dev builds use the version-less release subdir", func(t *testing.T) {
-		wrapper := claudeWrapperScript(wsHome, "", "1.2.3-dev+abc")
+		wrapper := claudeWrapperScript(wsHome, "1.2.3-dev+abc")
 		assert.Contains(t, wrapper, `/ssh-tunnel/1.2.3-dev+abc/databricks_cli_linux_${_arch}/databricks`)
-	})
-
-	t.Run("ucode source is forwarded to the shim", func(t *testing.T) {
-		const ucodePath = "/Workspace/Users/me@example.com/.databricks/ssh-tunnel/ucode/ucode-0.1.0.tar.gz"
-		wrapper := claudeWrapperScript(wsHome, ucodePath, "1.2.3")
-		assert.Contains(t, wrapper, "export "+ucodeSourceEnv+"='"+ucodePath+"'")
 	})
 }
 
@@ -419,7 +411,7 @@ func TestBuildSSHArgsPTYPlacement(t *testing.T) {
 	}
 
 	t.Run("interactive forces a PTY before the destination", func(t *testing.T) {
-		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "/Workspace/Users/me@example.com", "", "1.2.3", ClientOptions{})
+		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "/Workspace/Users/me@example.com", "1.2.3", ClientOptions{})
 		ptyIdx := indexOf(args, "-t")
 		hostIdx := indexOf(args, "myhost")
 		require.NotEqual(t, -1, ptyIdx, "-t must be present for interactive sessions")
@@ -431,7 +423,7 @@ func TestBuildSSHArgsPTYPlacement(t *testing.T) {
 	})
 
 	t.Run("non-interactive does not force a PTY", func(t *testing.T) {
-		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "", "", "1.2.3", ClientOptions{AdditionalArgs: []string{"ls", "-la"}})
+		args := buildSSHArgs("user", "/key", "proxy command", "myhost", "", "1.2.3", ClientOptions{AdditionalArgs: []string{"ls", "-la"}})
 		assert.Equal(t, -1, indexOf(args, "-t"), "no PTY for non-interactive passthrough")
 		hostIdx := indexOf(args, "myhost")
 		require.NotEqual(t, -1, hostIdx)

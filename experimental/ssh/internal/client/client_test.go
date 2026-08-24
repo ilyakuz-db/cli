@@ -86,15 +86,6 @@ func TestValidate(t *testing.T) {
 			opts: client.ClientOptions{ClusterID: "abc-123", IDE: "cursor"},
 		},
 		{
-			name:    "ucode source with ide vscode",
-			opts:    client.ClientOptions{ClusterID: "abc-123", IDE: "vscode", UcodeSource: "/local/ucode"},
-			wantErr: `--ucode-source cannot be used with --ide "vscode"; it only applies to the default shell session`,
-		},
-		{
-			name: "valid ucode source on the default shell session",
-			opts: client.ClientOptions{ClusterID: "abc-123", UcodeSource: "/local/ucode"},
-		},
-		{
 			name:    "environment version too low",
 			opts:    client.ClientOptions{ClusterID: "abc-123", EnvironmentVersion: 3},
 			wantErr: "environment version must be >= 4, got 3",

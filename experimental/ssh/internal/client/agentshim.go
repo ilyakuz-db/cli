@@ -27,14 +27,11 @@ const (
 	// binary rather than looping back into the wrapper.
 	ucodeShimDirName = ".ucode-shim"
 
-	// ucodeGitSource is the published ucode build installed when --ucode-source
-	// isn't supplied.
-	ucodeGitSource = "git+https://github.com/anton-107/ucode@remote-env-token-auth"
-
-	// ucodeSourceEnv, when set in the wrapper's environment (via --ucode-source),
-	// is the /Workspace path of a locally-built ucode sdist to force-reinstall
-	// from instead of ucodeGitSource.
-	ucodeSourceEnv = "DATABRICKS_UCODE_SOURCE"
+	// ucodeGitSource is the stock (upstream) ucode build. It runs unmodified in the
+	// ssh-connect session: we set DATABRICKS_BEARER (its existing env-bearer
+	// short-circuit) and pass `--workspace $DATABRICKS_HOST`, so no ucode fork is
+	// needed.
+	ucodeGitSource = "git+https://github.com/databricks/ucode"
 
 	// workspaceHomeEnv carries the user's workspace home (/Workspace/Users/<email>)
 	// resolved client-side, so the shim can weave it into the agent context without
@@ -49,8 +46,8 @@ const (
 	// passes to Claude Code via --append-system-prompt-file.
 	contextFileName = ".ucode-claude-context.md"
 
-	// readyFileName marks that first-run setup completed; it stores the resolved
-	// PATH so later launches skip the bootstrap and configure steps entirely.
+	// readyFileName marks that first-run toolchain setup completed; it stores the
+	// resolved PATH so later launches skip the uv/ucode/Node bootstrap entirely.
 	readyFileName = ".ready"
 )
 
@@ -66,7 +63,10 @@ func RunClaudeAgentShim(ctx context.Context, client *databricks.WorkspaceClient,
 	if err := probeAIGateway(ctx, client); err != nil {
 		return err
 	}
-	return bootstrapAndLaunchClaude(ctx, claudeArgs)
+	// Pass the resolved host to ucode as `--workspace` so it configures headlessly
+	// (no prompt) against the same workspace the probe validated.
+	workspace := strings.TrimRight(client.Config.Host, "/")
+	return bootstrapAndLaunchClaude(ctx, workspace, claudeArgs)
 }
 
 // claudeGatewayModelPrefix identifies a Claude serving endpoint on the AI Gateway.
@@ -121,7 +121,7 @@ func probeAIGateway(ctx context.Context, client *databricks.WorkspaceClient) err
 // bootstrapAndLaunchClaude installs the toolchain (first run only) and launches
 // ucode-configured Claude Code, replacing the current process. On repeat launches
 // it restores the PATH recorded by the first run and skips straight to the launch.
-func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
+func bootstrapAndLaunchClaude(ctx context.Context, workspace string, claudeArgs []string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("failed to resolve home directory: %w", err)
@@ -132,7 +132,7 @@ func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
 
 	// Fast path: first-run setup recorded the resolved PATH; restore it and launch.
 	if data, err := os.ReadFile(readyFile); err == nil {
-		return launchUcodeClaude(strings.TrimSpace(string(data)), contextFile, claudeArgs)
+		return launchUcodeClaude(strings.TrimSpace(string(data)), workspace, contextFile, claudeArgs)
 	}
 
 	// Build the PATH we run tooling (and ultimately ucode) under: the session PATH
@@ -142,6 +142,13 @@ func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
 	pathDirs := removePathDir(splitPathList(os.Getenv("PATH")), shimDir)
 	pathDirs = prependPathDir(pathDirs, filepath.Join(home, ".local", "bin"))
 
+	// Put this binary's own directory (the uploaded `databricks` CLI) on PATH so
+	// stock ucode's mandatory install_databricks_cli() finds `databricks` already
+	// present and skips installing it (the serverless image has no brew/curl path).
+	if self, err := os.Executable(); err == nil {
+		pathDirs = prependPathDir(pathDirs, filepath.Dir(self))
+	}
+
 	// 1. uv (installs into ~/.local/bin).
 	if findInPath(pathDirs, "uv") == "" {
 		cmdio.LogString(ctx, "Installing uv...")
@@ -150,14 +157,9 @@ func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
 		}
 	}
 
-	// 2. ucode. --ucode-source force-reinstalls from the uploaded sdist so a local
-	// branch takes effect; otherwise install the published build once.
-	if source := os.Getenv(ucodeSourceEnv); source != "" {
-		cmdio.LogString(ctx, "Installing ucode from "+source+"...")
-		if err := runCommand(ctx, pathDirs, "uv", "tool", "install", "--reinstall", source); err != nil {
-			return fmt.Errorf("failed to install ucode from %s: %w", source, err)
-		}
-	} else if findInPath(pathDirs, "ucode") == "" {
+	// 2. ucode (stock upstream build; runs unmodified thanks to DATABRICKS_BEARER +
+	// --workspace set at launch below).
+	if findInPath(pathDirs, "ucode") == "" {
 		cmdio.LogString(ctx, "Installing ucode...")
 		if err := runCommand(ctx, pathDirs, "uv", "tool", "install", ucodeGitSource); err != nil {
 			return fmt.Errorf("failed to install ucode: %w", err)
@@ -180,13 +182,11 @@ func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
 		pathDirs = prependPathDir(pathDirs, filepath.Join(prefix, "bin"))
 	}
 
-	// 5. Configure Claude Code against the session's workspace, then record the
-	// resolved PATH so subsequent launches take the fast path above.
+	// 5. Write the agent context, then record the resolved PATH so subsequent
+	// launches take the fast path above. ucode itself does the workspace
+	// configuration on first `ucode claude --workspace` launch.
 	if err := os.WriteFile(contextFile, []byte(claudeSystemContext(os.Getenv(workspaceHomeEnv))), 0o644); err != nil {
 		return fmt.Errorf("failed to write agent context file: %w", err)
-	}
-	if err := runCommand(ctx, pathDirs, "ucode", "configure", "--agent", "claude", "--enable-databricks-ai-tools", "--skip-validate"); err != nil {
-		return fmt.Errorf("ucode configure failed: %w", err)
 	}
 	pathEnv := strings.Join(pathDirs, string(os.PathListSeparator))
 	if err := os.MkdirAll(shimDir, 0o755); err != nil {
@@ -196,18 +196,37 @@ func bootstrapAndLaunchClaude(ctx context.Context, claudeArgs []string) error {
 		return fmt.Errorf("failed to record setup completion: %w", err)
 	}
 
-	return launchUcodeClaude(pathEnv, contextFile, claudeArgs)
+	return launchUcodeClaude(pathEnv, workspace, contextFile, claudeArgs)
 }
 
 // launchUcodeClaude replaces the current process with `ucode claude`, pinning the
-// resolved PATH and pointing Claude Code at the agent context file.
-func launchUcodeClaude(pathEnv, contextFile string, claudeArgs []string) error {
+// resolved PATH, targeting the session workspace (so ucode configures headlessly),
+// and pointing Claude Code at the agent context file.
+func launchUcodeClaude(pathEnv, workspace, contextFile string, claudeArgs []string) error {
 	ucodePath := findInPath(splitPathList(pathEnv), "ucode")
 	if ucodePath == "" {
 		return errors.New("ucode was not found on PATH after setup")
 	}
-	argv := append([]string{"ucode", "claude", "--append-system-prompt-file", contextFile}, claudeArgs...)
-	return execProcess(ucodePath, argv, replaceEnvPath(os.Environ(), pathEnv))
+	argv := []string{"ucode", "claude"}
+	if workspace != "" {
+		argv = append(argv, "--workspace", workspace)
+	}
+	argv = append(argv, "--append-system-prompt-file", contextFile)
+	argv = append(argv, claudeArgs...)
+	return execProcess(ucodePath, argv, ucodeLaunchEnv(pathEnv))
+}
+
+// ucodeLaunchEnv returns the process environment for `ucode claude`: the resolved
+// PATH, plus DATABRICKS_BEARER set from the session's token so stock ucode's
+// env-bearer short-circuit authenticates without shelling out to `databricks auth`.
+func ucodeLaunchEnv(pathEnv string) []string {
+	env := replaceEnvPath(os.Environ(), pathEnv)
+	if os.Getenv("DATABRICKS_BEARER") == "" {
+		if token := os.Getenv("DATABRICKS_TOKEN"); token != "" {
+			env = append(env, "DATABRICKS_BEARER="+token)
+		}
+	}
+	return env
 }
 
 // ensureNode downloads the latest Krypton LTS Node build into ~/.ucode-node (once)

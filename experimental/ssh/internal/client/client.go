@@ -28,7 +28,6 @@ import (
 	"github.com/databricks/cli/internal/build"
 	"github.com/databricks/cli/libs/auth"
 	"github.com/databricks/cli/libs/cmdio"
-	"github.com/databricks/cli/libs/filer"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/telemetry"
 	"github.com/databricks/cli/libs/telemetry/protos"
@@ -122,9 +121,6 @@ type ClientOptions struct {
 	AutoApprove bool
 	// Id of the usage policy to use for the serverless SSH server job. Serverless only.
 	UsagePolicyID string
-	// Local ucode source directory to build and use with --ide claude, instead of
-	// the published GitHub build. Dev/test only; requires --ide claude.
-	UcodeSource string
 }
 
 func (o *ClientOptions) Validate() error {
@@ -145,11 +141,6 @@ func (o *ClientOptions) Validate() error {
 	}
 	if o.IDE != "" && o.IDE != vscode.VSCodeOption && o.IDE != vscode.CursorOption {
 		return fmt.Errorf("invalid IDE value: %q, expected %q or %q", o.IDE, vscode.VSCodeOption, vscode.CursorOption)
-	}
-	// --ucode-source only feeds the default shell session's `claude` launcher, which
-	// isn't installed on the GUI (vscode/cursor) path, so reject the combination.
-	if o.UcodeSource != "" && o.IDE != "" {
-		return fmt.Errorf("--ucode-source cannot be used with --ide %q; it only applies to the default shell session", o.IDE)
 	}
 	if o.EnvironmentVersion > 0 && o.EnvironmentVersion < minEnvironmentVersion {
 		return fmt.Errorf("environment version must be >= %d, got %d", minEnvironmentVersion, o.EnvironmentVersion)
@@ -762,66 +753,6 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// buildAndUploadUcode builds an sdist from the local ucode source directory with
-// `uv build` and uploads it to the user's workspace files, returning the /Workspace
-// path the remote can `uv tool install` from. An sdist (.tar.gz) is used rather than
-// a wheel because the workspace import-file API auto-unzips zip payloads (a wheel is
-// itself a zip), which would corrupt it. Requires the `uv` build tool locally.
-func buildAndUploadUcode(ctx context.Context, client *databricks.WorkspaceClient, srcDir, wsHome string) (string, error) {
-	if wsHome == "" {
-		return "", errors.New("could not resolve workspace home to upload ucode to")
-	}
-	if _, err := exec.LookPath("uv"); err != nil {
-		return "", fmt.Errorf("--ucode-source requires the `uv` build tool on PATH: %w", err)
-	}
-
-	tmpDir, err := os.MkdirTemp("", "ucode-sdist-*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	cmdio.LogString(ctx, "Building ucode from "+srcDir+"...")
-	buildCmd := exec.CommandContext(ctx, "uv", "build", "--sdist", "--out-dir", tmpDir, srcDir)
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("uv build failed: %w\n%s", err, out)
-	}
-
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to read build output: %w", err)
-	}
-	sdistName := ""
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tar.gz") {
-			sdistName = e.Name()
-			break
-		}
-	}
-	if sdistName == "" {
-		return "", errors.New("uv build produced no .tar.gz sdist")
-	}
-
-	// The workspace tree is FUSE-mounted on the driver at the same /Workspace path,
-	// so the upload destination and the remote install path are identical.
-	uploadDir := wsHome + "/.databricks/ssh-tunnel/ucode"
-	workspaceFiler, err := filer.NewWorkspaceFilesClient(client, uploadDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to create workspace files client: %w", err)
-	}
-	sdist, err := os.Open(filepath.Join(tmpDir, sdistName))
-	if err != nil {
-		return "", fmt.Errorf("failed to open sdist: %w", err)
-	}
-	defer sdist.Close()
-
-	cmdio.LogString(ctx, "Uploading ucode to the workspace...")
-	if err := workspaceFiler.Write(ctx, sdistName, sdist, filer.OverwriteIfExists, filer.CreateParentDirectories); err != nil {
-		return "", fmt.Errorf("failed to upload ucode sdist: %w", err)
-	}
-	return uploadDir + "/" + sdistName, nil
-}
-
 // remoteShimDir is the PATH directory the interactive session drops the `claude`
 // wrapper into. It's dedicated (not $HOME/bin) so nothing else can overwrite the
 // wrapper, and the agent shim excludes exactly this dir from the PATH it runs
@@ -842,10 +773,8 @@ const remoteShimDir = "$HOME/.ucode-shim"
 // wsHome is the user's workspace home (/Workspace/Users/<email>); it's forwarded to
 // the shim (via env) so the agent context names the working directory, and it also
 // anchors the uploaded-binary path, so the caller only installs the wrapper when it
-// resolved. ucodeRemotePath, when set, is the /Workspace path of a locally-built
-// ucode sdist uploaded by --ucode-source; it's forwarded so the shim force-reinstalls
-// ucode from it instead of the published build.
-func claudeWrapperScript(wsHome, ucodeRemotePath, version string) string {
+// resolved.
+func claudeWrapperScript(wsHome, version string) string {
 	versionedDir := wsHome + "/.databricks/ssh-tunnel/" + version
 	// Mirror getReleaseName (minus the .zip); ${_arch} is expanded on the remote
 	// so the client needn't know the driver's architecture.
@@ -855,9 +784,6 @@ func claudeWrapperScript(wsHome, ucodeRemotePath, version string) string {
 	var exports string
 	if wsHome != "" {
 		exports += "export " + workspaceHomeEnv + "=" + shellSingleQuote(wsHome) + "\n"
-	}
-	if ucodeRemotePath != "" {
-		exports += "export " + ucodeSourceEnv + "=" + shellSingleQuote(ucodeRemotePath) + "\n"
 	}
 
 	return fmt.Sprintf(`#!/usr/bin/env bash
@@ -895,7 +821,7 @@ esac
 // Note: this returns the remote command only. PTY allocation (-t) is added to
 // the ssh options *before* the destination by the caller; -t placed after the
 // host would be parsed as part of the remote command, not as ssh's flag.
-func buildRemoteShellArgs(opts ClientOptions, wsHome, ucodeRemotePath, version string) []string {
+func buildRemoteShellArgs(opts ClientOptions, wsHome, version string) []string {
 	if len(opts.AdditionalArgs) > 0 {
 		return opts.AdditionalArgs
 	}
@@ -915,7 +841,7 @@ cat > "%[1]s/claude" <<'UCODE_CLAUDE_WRAPPER_EOF'
 UCODE_CLAUDE_WRAPPER_EOF
 chmod +x "%[1]s/claude"
 export PATH="%[1]s:$PATH"
-`, remoteShimDir, claudeWrapperScript(wsHome, ucodeRemotePath, version))
+`, remoteShimDir, claudeWrapperScript(wsHome, version))
 	shell = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + shell
 	return []string{cmd + shell}
 }
@@ -925,7 +851,7 @@ export PATH="%[1]s:$PATH"
 // allocation (-t) for the interactive case is added before the host: ssh stops
 // parsing options at the destination, so a -t placed after the host would be
 // treated as part of the remote command rather than as ssh's force-PTY flag.
-func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath, version string, opts ClientOptions) []string {
+func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, version string, opts ClientOptions) []string {
 	sshArgs := []string{
 		"-l", userName,
 		"-i", privateKeyPath,
@@ -941,7 +867,7 @@ func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucod
 		sshArgs = append(sshArgs, "-t")
 	}
 	sshArgs = append(sshArgs, hostName)
-	sshArgs = append(sshArgs, buildRemoteShellArgs(opts, wsHome, ucodeRemotePath, version)...)
+	sshArgs = append(sshArgs, buildRemoteShellArgs(opts, wsHome, version)...)
 	return sshArgs
 }
 
@@ -969,20 +895,7 @@ func spawnSSHClient(ctx context.Context, client *databricks.WorkspaceClient, use
 		}
 	}
 
-	// --ucode-source: build the local ucode branch into an sdist and upload it to
-	// the workspace, so the claude launcher installs that instead of the published
-	// GitHub build. The workspace tree is FUSE-mounted on the driver, so the
-	// returned /Workspace path is directly installable there. Only relevant for an
-	// interactive session (where the launcher is written), matching wsHome above.
-	var ucodeRemotePath string
-	if opts.UcodeSource != "" && len(opts.AdditionalArgs) == 0 {
-		ucodeRemotePath, err = buildAndUploadUcode(ctx, client, opts.UcodeSource, wsHome)
-		if err != nil {
-			return fmt.Errorf("failed to prepare ucode from --ucode-source: %w", err)
-		}
-	}
-
-	sshArgs := buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath, version, opts)
+	sshArgs := buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, version, opts)
 
 	log.Debugf(ctx, "Launching SSH client: ssh %s", strings.Join(sshArgs, " "))
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
