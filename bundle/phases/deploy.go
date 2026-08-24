@@ -76,7 +76,7 @@ func approvalForDeploy(ctx context.Context, b *bundle.Bundle, plan *deployplan.P
 	return cmdio.AskYesOrNo(ctx, "Would you like to proceed?")
 }
 
-func deployCore(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan, stateEngine engine.EngineType, requestedEngine engine.EngineSetting) {
+func deployCore(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan, stateEngine engine.EngineType) {
 	// Apply resources and capture post-apply state.
 	// For direct: Finalize flushes the WAL to disk and returns the state;
 	// called even if Apply failed so partial progress is saved.
@@ -115,15 +115,6 @@ func deployCore(ctx context.Context, b *bundle.Bundle, plan *deployplan.Plan, st
 		metadata.Upload(),
 		statemgmt.UploadStateForYamlSync(stateEngine),
 	)
-
-	// Once the deploy is complete, dry-run the migration to the direct engine
-	// and record the outcome in telemetry. If the user has opted in to the
-	// direct engine (via bundle.engine or DATABRICKS_BUNDLE_ENGINE) and the
-	// dry-run is clean, the migration is committed; otherwise nothing is
-	// written and the deploy is unaffected.
-	if !stateEngine.IsDirect() && !logdiag.HasError(ctx) {
-		statemgmt.MigrateToDirect(ctx, b, requestedEngine)
-	}
 }
 
 // reportPerResource reports whether the deploy should list resources individually
@@ -313,17 +304,29 @@ func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHand
 		return
 	}
 	if haveApproval {
-		deployCore(ctx, b, plan, stateEngine, requestedEngine)
+		deployCore(ctx, b, plan, stateEngine)
 	} else {
 		cmdio.LogString(ctx, "Deployment cancelled!")
 		return
 	}
 
+	// Nothing below runs if the deploy itself failed. Everything below therefore only
+	// has to ask whether the postdeploy script failed, never whether the deploy did.
 	if logdiag.HasError(ctx) {
 		return
 	}
 
 	bundle.ApplyContext(ctx, b, scripts.Execute(config.ScriptPostDeploy))
+
+	// Dry-run the migration to the direct engine and record the outcome in telemetry.
+	// If the user has opted in to the direct engine (via bundle.engine or
+	// DATABRICKS_BUNDLE_ENGINE) and the dry-run is clean, the migration is committed;
+	// otherwise nothing is written and the deploy is unaffected. Deliberately not
+	// gated on the postdeploy script: the resources are deployed either way, so the
+	// state describes the same deployment whether or not the script succeeded.
+	if !stateEngine.IsDirect() {
+		statemgmt.MigrateToDirect(ctx, b, requestedEngine)
+	}
 
 	// Report what was deployed, mirroring "bundle plan". Printed last so it does not
 	// precede (and appear to vouch for) the postdeploy script's output. Printed even
