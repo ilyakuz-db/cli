@@ -435,7 +435,7 @@ func Run(ctx context.Context, client *databricks.WorkspaceClient, opts ClientOpt
 		// Default shell session: spawnSSHClient drops a `claude` launcher onto PATH
 		// (see buildRemoteShellArgs) and opens an interactive bash.
 		log.Infof(ctx, "Additional SSH arguments: %v", opts.AdditionalArgs)
-		return spawnSSHClient(ctx, client, userName, keyPath, serverPort, clusterID, opts)
+		return spawnSSHClient(ctx, client, userName, keyPath, serverPort, clusterID, version, opts)
 	}
 }
 
@@ -822,132 +822,54 @@ func buildAndUploadUcode(ctx context.Context, client *databricks.WorkspaceClient
 	return uploadDir + "/" + sdistName, nil
 }
 
-// claudeShimDir is the PATH directory the interactive session drops the `claude`
-// launcher into. It's dedicated (not $HOME/bin) so an npm global install can
-// never overwrite the shim, and the re-entry guard can exclude exactly this dir.
-const claudeShimDir = "$HOME/.ucode-shim"
+// remoteShimDir is the PATH directory the interactive session drops the `claude`
+// wrapper into. It's dedicated (not $HOME/bin) so nothing else can overwrite the
+// wrapper, and the agent shim excludes exactly this dir from the PATH it runs
+// ucode under. It must expand (on the remote) to the same path the shim computes
+// from ucodeShimDirName.
+const remoteShimDir = "$HOME/.ucode-shim"
 
-// claudeStub returns the contents of the `claude` launcher installed onto the
-// remote PATH for every interactive session. Running `claude` the first time
-// installs uv + the env-aware ucode launcher (and Node/npm, which Claude Code
-// needs) and configures Claude Code against the session's workspace; every run
-// then delegates to `ucode claude`. ucode points Claude Code at the workspace AI
-// Gateway using the DATABRICKS_HOST / DATABRICKS_TOKEN the server injects, so no
-// auth or model wiring is needed here. Each install is guarded so later runs skip
-// straight to the launch.
+// claudeWrapperScript returns the tiny `claude` launcher installed onto the remote
+// PATH for every interactive session. It resolves the uploaded databricks CLI
+// binary for the driver's architecture and delegates to the hidden
+// `ssh agent-shim claude` subcommand, which probes the AI Gateway, bootstraps
+// ucode + Claude Code on first run, and launches ucode-configured Claude Code.
 //
-// Recursion guard: `ucode claude` execs the real `claude` via a PATH lookup
-// (os.execvp), which finds this shim again. The shim sets UCODE_CLAUDE_SHIM before
-// delegating; on re-entry it execs the first real claude on PATH that isn't in
-// claudeShimDir, breaking the loop regardless of where npm installed claude.
+// The databricks binary is uploaded per architecture (see uploadReleases) under a
+// version dir; the client knows the dir and the naming (getReleaseName) but not
+// the driver's architecture, so the wrapper fills that in via `uname -m`.
 //
-// wsHome is the user's workspace home (/Workspace/Users/<email>) when it could be
-// resolved, else empty; it is woven into the context so the agent knows its
-// working directory. ucodeRemotePath, when set, is the /Workspace path of a
-// locally-built ucode sdist uploaded by --ucode-source; ucode is force-reinstalled
-// from it (rather than the published GitHub build) so iterating on a local ucode
-// branch takes effect.
-func claudeStub(wsHome, ucodeRemotePath string) string {
-	cwd := "the user's Databricks workspace home directory"
+// wsHome is the user's workspace home (/Workspace/Users/<email>); it's forwarded to
+// the shim (via env) so the agent context names the working directory, and it also
+// anchors the uploaded-binary path, so the caller only installs the wrapper when it
+// resolved. ucodeRemotePath, when set, is the /Workspace path of a locally-built
+// ucode sdist uploaded by --ucode-source; it's forwarded so the shim force-reinstalls
+// ucode from it instead of the published build.
+func claudeWrapperScript(wsHome, ucodeRemotePath, version string) string {
+	versionedDir := wsHome + "/.databricks/ssh-tunnel/" + version
+	// Mirror getReleaseName (minus the .zip); ${_arch} is expanded on the remote
+	// so the client needn't know the driver's architecture.
+	subdir := strings.TrimSuffix(getReleaseName("${_arch}", version), ".zip")
+	binary := versionedDir + "/" + subdir + "/databricks"
+
+	var exports string
 	if wsHome != "" {
-		cwd = wsHome
+		exports += "export " + workspaceHomeEnv + "=" + shellSingleQuote(wsHome) + "\n"
 	}
-	ucodeInstall := `command -v ucode >/dev/null 2>&1 || uv tool install git+https://github.com/anton-107/ucode@remote-env-token-auth`
 	if ucodeRemotePath != "" {
-		ucodeInstall = "uv tool install --reinstall " + shellSingleQuote(ucodeRemotePath)
+		exports += "export " + ucodeSourceEnv + "=" + shellSingleQuote(ucodeRemotePath) + "\n"
 	}
-	systemContext := fmt.Sprintf(`You are running inside a "databricks ssh connect" session on the driver node of a
-Databricks serverless cluster.
-- The "databricks" CLI is installed and already authenticated: DATABRICKS_HOST and
-  DATABRICKS_TOKEN are set in the environment, so "databricks ..." commands work with no
-  "databricks auth login". The same token governs Unity Catalog and serving-endpoint access.
-- This container is ephemeral; only paths under /Workspace persist across sessions. Your
-  working directory is %s.
-- DATABRICKS_TOKEN is a static session token that may expire during a long session; if
-  "databricks" calls start failing with auth errors, the session likely needs reconnecting.
-- You can run shell commands and use the "databricks" CLI to explore the workspace
-  (clusters, jobs, Unity Catalog, DBFS, etc.).
-- If the user asks to set up a new project, suggest scaffolding it with "databricks bundle
-  init" (Databricks Asset Bundles / DABs). If the project needs any resources deployed
-  (jobs, pipelines, serving endpoints, etc.), define them in the bundle and deploy via
-  "databricks bundle deploy" rather than creating them ad hoc.`, cwd)
 
 	return fmt.Sprintf(`#!/usr/bin/env bash
-# ucode "claude" launcher, installed on PATH by "databricks ssh connect".
-# First run bootstraps ucode + Claude Code; every run delegates to "ucode claude".
-SHIM_DIR="%s"
-
-# Recursion safety net: we drop this shim's dir from PATH before handing off to
-# "ucode claude" below, so ucode should never exec back into this shim. If some
-# PATH quirk still routes "claude" here while we are delegating, hand off to the
-# first real claude on PATH rather than looping forever.
-if [ -n "$UCODE_CLAUDE_SHIM" ]; then
-  IFS=:
-  for d in $PATH; do
-    if [ "$d" != "$SHIM_DIR" ] && [ -x "$d/claude" ]; then exec "$d/claude" "$@"; fi
-  done
-  echo "claude: ucode shim could not find the real claude binary on PATH" >&2
-  exit 127
-fi
-export UCODE_CLAUDE_SHIM=1
-export PATH="$HOME/.local/bin:$PATH"
-
-command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
-%s
-
-# Claude Code needs Node/npm; serverless images don't ship it. Fetch the latest
-# Krypton LTS build into a non-PATH dir and prepend it. The $NODE_DIR/bin/npm
-# check keeps this idempotent so later runs skip the download.
-if ! command -v npm >/dev/null 2>&1; then
-  NODE_DIR="$HOME/.ucode-node"
-  if [ ! -x "$NODE_DIR/bin/npm" ]; then
-    case "$(uname -m)" in
-      x86_64|amd64) node_arch=x64 ;;
-      aarch64|arm64) node_arch=arm64 ;;
-      *) node_arch=$(uname -m) ;;
-    esac
-    node_base="https://nodejs.org/dist/latest-krypton"
-    node_tar=$(curl -fsSL "$node_base/SHASUMS256.txt" | grep -o "node-v[0-9.]*-linux-${node_arch}\.tar\.xz" | head -n1)
-    mkdir -p "$NODE_DIR"
-    curl -fsSL "$node_base/$node_tar" | tar -xJ --strip-components=1 -C "$NODE_DIR" -f -
-  fi
-  export PATH="$NODE_DIR/bin:$PATH"
-fi
-
-# ucode installs Claude Code with "npm install -g" and then execs "claude" via a
-# PATH lookup. Put npm's global bin ahead of this shim on PATH so that real binary
-# is found directly — without it, a pre-existing npm whose global bin isn't on PATH
-# leaves the launcher unable to resolve claude after installing.
-npm_prefix=$(npm prefix -g 2>/dev/null)
-if [ -n "$npm_prefix" ]; then
-  case ":$PATH:" in
-    *":$npm_prefix/bin:"*) ;;
-    *) export PATH="$npm_prefix/bin:$PATH" ;;
-  esac
-fi
-
-# ucode installs Claude Code with "npm install -g" only when "claude" isn't already
-# on PATH — but this shim IS a "claude" on PATH, so ucode would think it's installed,
-# skip the install, and exec straight back into this shim. Drop our own dir from PATH
-# before delegating so ucode sees (and installs) the real claude instead.
-_clean_path=""
-IFS=:
-for d in $PATH; do
-  [ "$d" = "$SHIM_DIR" ] || _clean_path="${_clean_path:+$_clean_path:}$d"
-done
-unset IFS
-export PATH="$_clean_path"
-
-# Configure Claude Code against the session's workspace once (the marker keeps
-# later runs on the fast path: just "ucode claude").
-if [ ! -f "$SHIM_DIR/.configured" ]; then
-  cat > "$HOME/.ucode-claude-context.md" <<'CTX'
-%s
-CTX
-  ucode configure --agent claude --enable-databricks-ai-tools --skip-validate && touch "$SHIM_DIR/.configured"
-fi
-
-exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "$@"`, claudeShimDir, ucodeInstall, systemContext)
+# "claude" launcher installed by "databricks ssh connect". Delegates to the CLI's
+# hidden "ssh agent-shim claude", which probes the workspace AI Gateway, installs
+# ucode + Claude Code on first run, and launches ucode-configured Claude Code.
+case "$(uname -m)" in
+  x86_64|amd64) _arch=amd64 ;;
+  aarch64|arm64) _arch=arm64 ;;
+  *) echo "claude: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+%sexec "%s" ssh agent-shim claude "$@"`, exports, binary)
 }
 
 // buildRemoteShellArgs returns the ssh arguments that follow the hostname.
@@ -962,10 +884,10 @@ exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "
 // -i avoids that reset; the server's ~/.bashrc snippet (see seedEnvActivation) then
 // re-prepends the environment bin after /etc/bash.bashrc runs, so bare `python`/`pip`
 // resolve to the environment interpreter. Before launching bash it installs the
-// `claude` launcher (see claudeStub) into a PATH dir, so `claude` is available in
-// any interactive session. When wsHome is set, the command first changes into the
-// user's workspace home folder; if that directory is missing the cd is ignored and
-// it still runs from $HOME.
+// `claude` launcher (see claudeWrapperScript) into a PATH dir, so `claude` is
+// available in any interactive session. When wsHome is set, the command first
+// changes into the user's workspace home folder; if that directory is missing the
+// cd is ignored and it still runs from $HOME.
 //
 // For the non-interactive case (e.g. `databricks ssh connect ... -- ls -la`),
 // the user's command is returned verbatim so behavior is unchanged.
@@ -973,24 +895,28 @@ exec ucode claude --append-system-prompt-file "$HOME/.ucode-claude-context.md" "
 // Note: this returns the remote command only. PTY allocation (-t) is added to
 // the ssh options *before* the destination by the caller; -t placed after the
 // host would be parsed as part of the remote command, not as ssh's flag.
-func buildRemoteShellArgs(opts ClientOptions, wsHome, ucodeRemotePath string) []string {
+func buildRemoteShellArgs(opts ClientOptions, wsHome, ucodeRemotePath, version string) []string {
 	if len(opts.AdditionalArgs) > 0 {
 		return opts.AdditionalArgs
 	}
-	// Install the `claude` launcher onto PATH, then open the shell. The shim file
-	// is written via a quoted heredoc so its own $VARS and inner heredoc are stored
-	// verbatim rather than expanded here.
+	shell := `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
+	// The claude wrapper locates the uploaded CLI under the user's workspace path,
+	// so it can only be installed when wsHome resolved. Without it, still open the
+	// shell (just no `claude` launcher).
+	if wsHome == "" {
+		return []string{shell}
+	}
+	// Install the `claude` launcher onto PATH, then open the shell. The wrapper is
+	// written via a quoted heredoc so its own $VARS are stored verbatim rather than
+	// expanded here.
 	cmd := fmt.Sprintf(`mkdir -p "%[1]s"
-cat > "%[1]s/claude" <<'UCODE_CLAUDE_SHIM_EOF'
+cat > "%[1]s/claude" <<'UCODE_CLAUDE_WRAPPER_EOF'
 %[2]s
-UCODE_CLAUDE_SHIM_EOF
+UCODE_CLAUDE_WRAPPER_EOF
 chmod +x "%[1]s/claude"
 export PATH="%[1]s:$PATH"
-`, claudeShimDir, claudeStub(wsHome, ucodeRemotePath))
-	shell := `command -v bash >/dev/null 2>&1 && exec bash -i || exec "${SHELL:-/bin/sh}" -i`
-	if wsHome != "" {
-		shell = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + shell
-	}
+`, remoteShimDir, claudeWrapperScript(wsHome, ucodeRemotePath, version))
+	shell = "cd " + shellSingleQuote(wsHome) + " 2>/dev/null; " + shell
 	return []string{cmd + shell}
 }
 
@@ -999,7 +925,7 @@ export PATH="%[1]s:$PATH"
 // allocation (-t) for the interactive case is added before the host: ssh stops
 // parsing options at the destination, so a -t placed after the host would be
 // treated as part of the remote command rather than as ssh's force-PTY flag.
-func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath string, opts ClientOptions) []string {
+func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath, version string, opts ClientOptions) []string {
 	sshArgs := []string{
 		"-l", userName,
 		"-i", privateKeyPath,
@@ -1015,11 +941,11 @@ func buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucod
 		sshArgs = append(sshArgs, "-t")
 	}
 	sshArgs = append(sshArgs, hostName)
-	sshArgs = append(sshArgs, buildRemoteShellArgs(opts, wsHome, ucodeRemotePath)...)
+	sshArgs = append(sshArgs, buildRemoteShellArgs(opts, wsHome, ucodeRemotePath, version)...)
 	return sshArgs
 }
 
-func spawnSSHClient(ctx context.Context, client *databricks.WorkspaceClient, userName, privateKeyPath string, serverPort int, clusterID string, opts ClientOptions) error {
+func spawnSSHClient(ctx context.Context, client *databricks.WorkspaceClient, userName, privateKeyPath string, serverPort int, clusterID, version string, opts ClientOptions) error {
 	// Create a copy with metadata for the ProxyCommand
 	optsWithMetadata := opts
 	optsWithMetadata.ServerMetadata = FormatMetadata(userName, serverPort, clusterID)
@@ -1056,7 +982,7 @@ func spawnSSHClient(ctx context.Context, client *databricks.WorkspaceClient, use
 		}
 	}
 
-	sshArgs := buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath, opts)
+	sshArgs := buildSSHArgs(userName, privateKeyPath, proxyCommand, hostName, wsHome, ucodeRemotePath, version, opts)
 
 	log.Debugf(ctx, "Launching SSH client: ssh %s", strings.Join(sshArgs, " "))
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
